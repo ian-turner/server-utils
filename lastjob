@@ -1,0 +1,5 @@
+#!/bin/bash
+
+LOG_DIR=/work/`whoami`/jobs/logs
+cat $LOG_DIR/`ls -1tr $LOG_DIR | grep .out | tail -n1`
+cat $LOG_DIR/`ls -1tr $LOG_DIR | grep .err | tail -n1`

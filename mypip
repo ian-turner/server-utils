@@ -1,0 +1,5 @@
+#!/bin/bash
+
+CACHE_DIR=/work/`whoami`/pip_cache
+mkdir -p "$CACHE_DIR"
+TMPDIR="$CACHE_DIR" pip --cache-dir "$CACHE_DIR" $@

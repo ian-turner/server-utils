@@ -1,0 +1,5 @@
+#!/bin/bash
+
+USERNAME=`whoami`
+ID=`squeue -u $USERNAME -o "%.8i" | tail -n +2`
+scancel $ID
