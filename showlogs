@@ -1,0 +1,5 @@
+#!/bin/bash
+
+JOBID="$1"
+LOGDIR="/work/irturner/jobs/logs"
+cat $LOGDIR/*$JOBID*
