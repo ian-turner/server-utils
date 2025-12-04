@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# Utility for creating a file with the greedy
+# test solved percentages for each training update
+
+DIR="$1"
+cat "$DIR/output.txt" | grep "solved (best)" | awk '{print substr($5, 0, length($5)-1)}' > "$DIR/train_prog.txt"
