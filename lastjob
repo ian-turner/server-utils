@@ -1,5 +1,9 @@
 #!/bin/bash
 
 LOG_DIR=/work/`whoami`/jobs/logs
-cat $LOG_DIR/`ls -1tr $LOG_DIR | grep .out | tail -n1`
-cat $LOG_DIR/`ls -1tr $LOG_DIR | grep .err | tail -n1`
+LAST_OUT=`ls -1tr $LOG_DIR | grep .out | tail -n1`
+LAST_ERR=`ls -1tr $LOG_DIR | grep .err | tail -n1`
+echo $LAST_OUT
+cat $LOG_DIR/$LAST_OUT
+echo $LAST_ERR
+cat $LOG_DIR/$LAST_ERR
