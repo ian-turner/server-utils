@@ -1,9 +1,803 @@
-#!/bin/bash
+#!/usr/bin/env python3
+"""lastjob - browse SLURM job logs in a terminal UI.
 
-LOG_DIR=/work/`whoami`/jobs/logs
-LAST_OUT=`ls -1tr $LOG_DIR | grep .out | tail -n1`
-LAST_ERR=`ls -1tr $LOG_DIR | grep .err | tail -n1`
-echo $LAST_OUT
-cat $LOG_DIR/$LAST_OUT
-echo $LAST_ERR
-cat $LOG_DIR/$LAST_ERR
+The log directory is scanned for stdout files (*.out or *.log) and stderr
+files (*.err).  Files that share a name apart from the extension, such as
+train-1234.out and train-1234.err, are grouped into one job.  Jobs are listed
+newest-first in a sidebar; select one with the arrow keys and its files are
+shown on the right together with their size and last-modified time.  The
+directory is rescanned every few seconds so running jobs update live.
+
+Environment variables (all optional; command line flags take precedence):
+  LASTJOB_LOG_DIR    directory holding the log files
+                     (default: /work/<user>/jobs/logs)
+  LASTJOB_REFRESH    seconds between automatic rescans          (default: 2)
+  LASTJOB_MAX_BYTES  show only the last N bytes of each file    (default: 2 MiB)
+
+When stdout is not a terminal (e.g. `lastjob | less`) or --plain is given,
+the newest job's files are printed instead, like the original script.
+Only the Python standard library is needed.
+"""
+
+import argparse
+import curses
+import getpass
+import locale
+import os
+import re
+import sys
+import time
+
+OUT_EXTS = (".out", ".log")
+ERR_EXTS = (".err",)
+DEFAULT_REFRESH = 2.0
+DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+VIEWS = ("both", "stdout", "stderr")
+
+# Fallback for terminals whose key sequences do not match their terminfo entry.
+ESCAPE_SEQUENCES = {
+    "[A": curses.KEY_UP, "OA": curses.KEY_UP,
+    "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN,
+    "[C": curses.KEY_RIGHT, "OC": curses.KEY_RIGHT,
+    "[D": curses.KEY_LEFT, "OD": curses.KEY_LEFT,
+    "[H": curses.KEY_HOME, "OH": curses.KEY_HOME, "[1~": curses.KEY_HOME, "[7~": curses.KEY_HOME,
+    "[F": curses.KEY_END, "OF": curses.KEY_END, "[4~": curses.KEY_END, "[8~": curses.KEY_END,
+    "[5~": curses.KEY_PPAGE, "[6~": curses.KEY_NPAGE, "[Z": curses.KEY_BTAB,
+}
+
+HELP_LINES = [
+    "lastjob keys",
+    "",
+    "Up / Down      select a job",
+    "j / k          scroll the log down / up one line",
+    "PgDn / PgUp    scroll one page (also Space / b)",
+    "Home / End     jump to the start / end of the log (also g / G)",
+    "Left / Right   scroll sideways (when wrapping is off)",
+    "Tab            cycle view: both / stdout / stderr (Shift-Tab reverses)",
+    "w              toggle line wrapping",
+    "f              follow: keep the end of the log in view as it grows",
+    "r              rescan the log directory now",
+    "?              show / hide this help",
+    "q / Esc        quit",
+]
+
+
+# ------------------------------------------------------------------ helpers
+
+def current_user():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER", "")
+
+
+def default_log_dir():
+    return os.path.join("/work", current_user(), "jobs", "logs")
+
+
+def env_number(name, default, convert):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return convert(value)
+    except ValueError:
+        sys.stderr.write("lastjob: ignoring invalid %s=%r\n" % (name, value))
+        return default
+
+
+def fmt_size(n):
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return "%d %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def elide_middle(text, width):
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    head = (width - 3) // 2
+    return text[:head] + "..." + text[len(text) - (width - 3 - head):]
+
+
+def display_path(path):
+    home = os.path.expanduser("~")
+    if home and home != "~" and (path == home or path.startswith(home + os.sep)):
+        return "~" + path[len(home):]
+    return path
+
+
+def fmt_time(t):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+
+
+def fmt_ago(seconds, short=False):
+    s = max(0, int(seconds))
+    if s < 60:
+        value, unit = s, "s"
+    elif s < 3600:
+        value, unit = s // 60, "m"
+    elif s < 86400:
+        value, unit = s // 3600, "h"
+    else:
+        value, unit = s // 86400, "d"
+    if short:
+        return "%d%s" % (value, unit)
+    if s < 5:
+        return "just now"
+    return "%d%s ago" % (value, unit)
+
+
+# ----------------------------------------------------------------- scanning
+
+class LogFile(object):
+    __slots__ = ("path", "name", "size", "mtime")
+
+    def __init__(self, path, name, st):
+        self.path = path
+        self.name = name
+        self.size = st.st_size
+        self.mtime = st.st_mtime
+
+    @property
+    def sig(self):
+        """Cheap change signature: differs whenever the file was rewritten."""
+        return (self.mtime, self.size)
+
+
+class Job(object):
+    __slots__ = ("name", "out", "err")
+
+    def __init__(self, name):
+        self.name = name
+        self.out = None
+        self.err = None
+
+    @property
+    def files(self):
+        return [f for f in (self.out, self.err) if f is not None]
+
+    @property
+    def mtime(self):
+        return max(f.mtime for f in self.files)
+
+    @property
+    def sig(self):
+        return (self.out.sig if self.out else None,
+                self.err.sig if self.err else None)
+
+
+def scan_jobs(log_dir):
+    """Return the jobs found in log_dir, newest first."""
+    jobs = {}
+    with os.scandir(log_dir) as entries:
+        for entry in entries:
+            stem, ext = os.path.splitext(entry.name)
+            ext = ext.lower()
+            if ext in OUT_EXTS:
+                slot = "out"
+            elif ext in ERR_EXTS:
+                slot = "err"
+            else:
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                st = entry.stat()
+            except OSError:
+                continue
+            logfile = LogFile(entry.path, entry.name, st)
+            job = jobs.setdefault(stem, Job(stem))
+            existing = getattr(job, slot)
+            if existing is None or logfile.mtime > existing.mtime:
+                setattr(job, slot, logfile)
+    return sorted(jobs.values(), key=lambda j: (j.mtime, j.name), reverse=True)
+
+
+# ------------------------------------------------------------ file contents
+
+ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"              # CSI sequences (colours, cursor)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC sequences (titles, links)
+    r"|\x1b[@-Z\\-_]"                       # other two-byte escapes
+)
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean_line(line):
+    """Make one line of log output safe and readable on the screen."""
+    line = ANSI_RE.sub("", line)
+    line = line.rstrip("\r")
+    if "\r" in line:
+        # Progress bars redraw a line with \r; keep the last frame only.
+        line = line.rsplit("\r", 1)[1]
+    line = line.expandtabs(8)
+    return CTRL_RE.sub("", line)
+
+
+def read_tail(path, max_bytes):
+    """Return (text, truncated) with at most max_bytes from the end of path."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        truncated = size > max_bytes
+        fh.seek(size - max_bytes if truncated else 0)
+        data = fh.read()
+    if truncated:
+        newline = data.find(b"\n")
+        if newline >= 0:
+            data = data[newline + 1:]
+    return data.decode("utf-8", errors="replace"), truncated
+
+
+class ContentCache(object):
+    """Holds cleaned file lines; a file is re-read only when it changes."""
+
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+        self._entries = {}
+
+    def lines(self, logfile):
+        entry = self._entries.get(logfile.path)
+        if entry is not None and entry[0] == logfile.sig:
+            return entry[1], entry[2]
+        try:
+            text, truncated = read_tail(logfile.path, self.max_bytes)
+            lines = [clean_line(line) for line in text.split("\n")]
+            if lines and lines[-1] == "":
+                lines.pop()  # the newline that ends the file
+        except OSError as exc:
+            lines, truncated = ["(cannot read file: %s)" % exc], False
+        self._entries[logfile.path] = (logfile.sig, lines, truncated)
+        return lines, truncated
+
+    def keep_only(self, paths):
+        for path in list(self._entries):
+            if path not in paths:
+                del self._entries[path]
+
+
+# ---------------------------------------------------------------------- UI
+
+class UI(object):
+
+    def __init__(self, scr, log_dir, refresh, max_bytes, jobs, selected):
+        self.scr = scr
+        self.log_dir = log_dir
+        self.refresh = max(0.2, refresh)
+        self.max_bytes = max_bytes
+        self.cache = ContentCache(max_bytes)
+        self.jobs = jobs
+        self.selected = selected
+        self.sidebar_top = 0
+        self.scroll = 0
+        self.hscroll = 0
+        self.view = 0
+        self.wrap = True
+        self.follow = False
+        self.help = False
+        self.scan_error = None
+        self.last_scan = time.monotonic()
+        self.last_scan_wall = time.time()
+        self._content_key = None
+        self._display = []
+        self._display_key = None
+        self._visible = (0, 0, 0)
+        self._content_h = 10
+        self._init_attrs()
+
+    def _init_attrs(self):
+        self.attr = {
+            "bar": curses.A_REVERSE,
+            "dim": curses.A_DIM,
+            "title": curses.A_BOLD,
+            "out_section": curses.A_BOLD,
+            "err_section": curses.A_BOLD,
+        }
+        if not curses.has_colors():
+            return
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            background = -1
+        except curses.error:
+            background = curses.COLOR_BLACK
+        try:
+            curses.init_pair(1, curses.COLOR_CYAN, background)
+            curses.init_pair(2, curses.COLOR_RED, background)
+        except curses.error:
+            return
+        self.attr.update({
+            "out_section": curses.color_pair(1) | curses.A_BOLD,
+            "err_section": curses.color_pair(2) | curses.A_BOLD,
+        })
+
+    # -- main loop ---------------------------------------------------------
+
+    def run(self):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.scr.keypad(True)
+        self.scr.timeout(250)
+        dirty = True
+        while True:
+            now = time.monotonic()
+            if now - self.last_scan >= self.refresh:
+                self.rescan()
+                dirty = True
+            if dirty:
+                self.draw()
+                dirty = False
+            try:
+                ch = self.scr.getch()
+            except KeyboardInterrupt:
+                return
+            if ch == -1:
+                continue
+            if ch == curses.KEY_RESIZE:
+                dirty = True
+                continue
+            if not self.handle_key(ch):
+                return
+            dirty = True
+
+    def rescan(self):
+        self.last_scan = time.monotonic()
+        self.last_scan_wall = time.time()
+        try:
+            jobs = scan_jobs(self.log_dir)
+        except OSError as exc:
+            self.scan_error = exc.strerror or str(exc)
+            return
+        self.scan_error = None
+        selected_name = self.current_job().name if self.jobs else None
+        self.jobs = jobs
+        if selected_name is not None:
+            for index, job in enumerate(jobs):
+                if job.name == selected_name:
+                    self.selected = index
+                    break
+            else:
+                self.selected = min(self.selected, max(0, len(jobs) - 1))
+        else:
+            self.selected = 0
+
+    def current_job(self):
+        if not self.jobs:
+            return None
+        self.selected = max(0, min(self.selected, len(self.jobs) - 1))
+        return self.jobs[self.selected]
+
+    # -- key handling ------------------------------------------------------
+
+    def handle_key(self, ch):
+        """Apply one key press; return False when the program should quit."""
+        if self.help:
+            self.help = False
+            return True
+        page = max(1, self._content_h - 1)
+        if ch == 27:
+            sequence = self.drain_escape()
+            if sequence is None:
+                return False  # a bare Escape key
+            key = ESCAPE_SEQUENCES.get(sequence)
+            return self.handle_key(key) if key is not None else True
+        if ch in (ord("q"), ord("Q")):
+            return False
+        elif ch == ord("?"):
+            self.help = True
+        elif ch == curses.KEY_UP:
+            self.select(self.selected - 1)
+        elif ch == curses.KEY_DOWN:
+            self.select(self.selected + 1)
+        elif ch == ord("j"):
+            self.scroll_by(1)
+        elif ch == ord("k"):
+            self.scroll_by(-1)
+        elif ch in (curses.KEY_NPAGE, ord(" ")):
+            self.scroll_by(page)
+        elif ch in (curses.KEY_PPAGE, ord("b")):
+            self.scroll_by(-page)
+        elif ch in (curses.KEY_HOME, ord("g")):
+            self.scroll = 0
+            self.follow = False
+        elif ch in (curses.KEY_END, ord("G")):
+            self.scroll = 1 << 30
+        elif ch == curses.KEY_LEFT:
+            self.hscroll = max(0, self.hscroll - 8)
+        elif ch == curses.KEY_RIGHT:
+            if not self.wrap:
+                self.hscroll += 8
+        elif ch == ord("\t"):
+            self.view = (self.view + 1) % len(VIEWS)
+        elif ch == curses.KEY_BTAB:
+            self.view = (self.view - 1) % len(VIEWS)
+        elif ch == ord("w"):
+            self.wrap = not self.wrap
+            self.hscroll = 0
+        elif ch == ord("f"):
+            self.follow = not self.follow
+            if self.follow:
+                self.scroll = 1 << 30
+        elif ch == ord("r"):
+            self.rescan()
+        return True
+
+    def drain_escape(self):
+        """After an Escape byte, collect any bytes that arrived with it.
+
+        Returns None for a bare Escape key press, otherwise the rest of an
+        escape sequence that curses did not recognise (for example when TERM
+        does not match the terminal); the caller maps the common ones.
+        """
+        self.scr.nodelay(True)
+        try:
+            rest = []
+            while True:
+                ch = self.scr.getch()
+                if ch == -1:
+                    break
+                rest.append(chr(ch) if 0 <= ch < 256 else "?")
+        finally:
+            self.scr.timeout(250)
+        return "".join(rest) if rest else None
+
+    def select(self, index):
+        if not self.jobs:
+            return
+        index = max(0, min(index, len(self.jobs) - 1))
+        if index == self.selected:
+            return
+        self.selected = index
+        self.scroll = (1 << 30) if self.follow else 0
+        self.hscroll = 0
+
+    def scroll_by(self, delta):
+        self.scroll = max(0, self.scroll + delta)
+        if delta < 0:
+            self.follow = False
+
+    # -- drawing -----------------------------------------------------------
+
+    def put(self, y, x, text, attr=0, width=None):
+        """addstr that never raises: clips to the screen and tolerates locale issues."""
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        if width is None or width > w - x:
+            width = w - x
+        if width <= 0:
+            return
+        text = text[:width]
+        try:
+            self.scr.addnstr(y, x, text, width, attr)
+        except UnicodeEncodeError:
+            try:
+                self.scr.addnstr(y, x, text.encode("ascii", "replace").decode("ascii"), width, attr)
+            except curses.error:
+                pass
+        except curses.error:
+            pass  # writing the bottom-right cell always "fails" after drawing it
+
+    def sidebar_width(self, w):
+        longest = max((len(job.name) for job in self.jobs), default=10)
+        return max(18, min(longest + 7, w // 3))
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 6 or w < 40:
+            self.put(0, 0, "lastjob: terminal too small (need 40x6)")
+            scr.refresh()
+            return
+        job = self.current_job()
+        if job is not None:
+            self.cache.keep_only(set(f.path for f in job.files))
+        self.draw_header(w)
+        sidebar_w = self.sidebar_width(w)
+        body_top, body_h = 1, h - 2
+        self.draw_sidebar(body_top, body_h, sidebar_w)
+        try:
+            scr.vline(body_top, sidebar_w, curses.ACS_VLINE, body_h)
+        except curses.error:
+            pass
+        x0 = sidebar_w + 1
+        pane_w = w - x0
+        if job is None:
+            message = "No log files found in %s" % elide_middle(
+                display_path(self.log_dir), max(8, pane_w - 2 - len("No log files found in ")))
+            self.put(body_top + 1, x0 + 1, message, self.attr["dim"], pane_w - 2)
+            self.put(body_top + 2, x0 + 1, "Looking for *.out, *.log and *.err files. Waiting...",
+                     self.attr["dim"], pane_w - 2)
+            self._visible = (0, 0, 0)
+        else:
+            y = self.draw_details(body_top, x0, pane_w, job)
+            content_h = body_top + body_h - y
+            self._content_h = content_h
+            self.draw_content(y, x0, content_h, pane_w, job)
+        self.draw_footer(h - 1, w)
+        scr.noutrefresh()
+        if self.help:
+            self.draw_help(h, w)
+        curses.doupdate()
+
+    def draw_header(self, w):
+        n = len(self.jobs)
+        parts = []
+        if self.scan_error:
+            parts.append("ERROR: %s" % self.scan_error)
+        else:
+            parts.append("%d job%s" % (n, "" if n == 1 else "s"))
+        parts.append("scanned %s" % fmt_ago(time.time() - self.last_scan_wall))
+        rest = "   ".join(parts)
+        prefix = " lastjob  "
+        path = elide_middle(display_path(self.log_dir), max(8, w - len(prefix) - len(rest) - 4))
+        text = prefix + path + "   " + rest
+        self.put(0, 0, text.ljust(w), self.attr["bar"], w)
+
+    def draw_sidebar(self, y0, h, w):
+        n = len(self.jobs)
+        if n == 0:
+            self.put(y0, 1, "(no jobs)", self.attr["dim"], w - 1)
+            return
+        if self.selected < self.sidebar_top:
+            self.sidebar_top = self.selected
+        elif self.selected >= self.sidebar_top + h:
+            self.sidebar_top = self.selected - h + 1
+        self.sidebar_top = max(0, min(self.sidebar_top, max(0, n - h)))
+        now = time.time()
+        for row in range(h):
+            index = self.sidebar_top + row
+            if index >= n:
+                break
+            job = self.jobs[index]
+            age = fmt_ago(now - job.mtime, short=True)
+            name_w = max(1, w - 3 - len(age))
+            name = job.name
+            if len(name) > name_w:
+                name = name[:max(0, name_w - 1)] + "~"
+            line = " %-*s %s" % (name_w, name, age)
+            attr = curses.A_REVERSE if index == self.selected else 0
+            self.put(y0 + row, 0, line.ljust(w), attr, w)
+
+    def draw_details(self, y, x, w, job):
+        now = time.time()
+        self.put(y, x + 1, job.name, self.attr["title"], w - 2)
+        y += 1
+        for kind, logfile in (("stdout", job.out), ("stderr", job.err)):
+            if logfile is None:
+                text = "%-6s  (no file)" % kind
+                attr = self.attr["dim"]
+            else:
+                text = "%-6s  %s  %s  modified %s (%s)" % (
+                    kind, logfile.name, fmt_size(logfile.size),
+                    fmt_time(logfile.mtime), fmt_ago(now - logfile.mtime))
+                attr = 0
+            self.put(y, x + 1, text, attr, w - 2)
+            y += 1
+        try:
+            self.scr.hline(y, x, curses.ACS_HLINE, w)
+        except curses.error:
+            pass
+        return y + 1
+
+    def build_display(self, job, width):
+        """The (text, attr) lines of the content pane for the current view."""
+        key = (job.name, job.sig, self.view, self.wrap, width)
+        if key == self._display_key:
+            return self._display
+        view = VIEWS[self.view]
+        sections = []
+        if view in ("both", "stdout"):
+            sections.append(("stdout", job.out, self.attr["out_section"]))
+        if view in ("both", "stderr"):
+            sections.append(("stderr", job.err, self.attr["err_section"]))
+        logical = []
+        for kind, logfile, attr in sections:
+            title = "---- %s: %s " % (kind, logfile.name if logfile else "(no file)")
+            logical.append((title + "-" * max(0, width - len(title)), attr))
+            if logfile is None:
+                continue
+            lines, truncated = self.cache.lines(logfile)
+            if truncated:
+                logical.append(("[... start of file not shown: last %s of %s ...]"
+                                % (fmt_size(self.max_bytes), fmt_size(logfile.size)),
+                                self.attr["dim"]))
+            if not lines:
+                logical.append(("(empty)", self.attr["dim"]))
+            logical.extend((line, 0) for line in lines)
+        if self.wrap and width > 0:
+            display = []
+            for text, attr in logical:
+                if len(text) <= width:
+                    display.append((text, attr))
+                else:
+                    for start in range(0, len(text), width):
+                        display.append((text[start:start + width], attr))
+        else:
+            display = logical
+        self._display_key = key
+        self._display = display
+        return display
+
+    def draw_content(self, y, x, h, w, job):
+        width = w - 1
+        display = self.build_display(job, width)
+        content_key = (job.name, job.sig, self.view)
+        if content_key != self._content_key:
+            self._content_key = content_key
+            if self.follow:
+                self.scroll = 1 << 30
+        max_scroll = max(0, len(display) - h)
+        self.scroll = max(0, min(self.scroll, max_scroll))
+        for row in range(h):
+            index = self.scroll + row
+            if index >= len(display):
+                break
+            text, attr = display[index]
+            if not self.wrap and self.hscroll:
+                text = text[self.hscroll:]
+            self.put(y + row, x + 1, text, attr, width)
+        shown = min(len(display), self.scroll + h)
+        self._visible = (self.scroll + 1 if display else 0, shown, len(display))
+
+    def draw_footer(self, y, w):
+        hints = (" q:quit  ?:help  Up/Down:job  j/k PgUp/PgDn:scroll  "
+                 "Tab:view  w:wrap  f:follow  r:rescan")
+        first, last, total = self._visible
+        status = "view:%s  wrap:%s  follow:%s" % (
+            VIEWS[self.view], "on" if self.wrap else "off", "ON" if self.follow else "off")
+        if total:
+            status += "  lines %d-%d/%d" % (first, last, total)
+        if not self.wrap and self.hscroll:
+            status += "  col %d+" % (self.hscroll + 1)
+        status += " "
+        room = w - len(status) - 1
+        if room < len(hints):
+            cut = hints.rfind("  ", 0, max(0, room))
+            hints = hints[:cut] if cut > 0 else ""
+        line = hints.ljust(max(0, w - len(status))) + status
+        self.put(y, 0, line, self.attr["bar"], w)
+
+    def draw_help(self, h, w):
+        box_h = min(h, len(HELP_LINES) + 2)
+        box_w = min(w, max(len(line) for line in HELP_LINES) + 4)
+        y = max(0, (h - box_h) // 2)
+        x = max(0, (w - box_w) // 2)
+        try:
+            win = curses.newwin(box_h, box_w, y, x)
+            win.erase()
+            win.box()
+            for row, line in enumerate(HELP_LINES[:box_h - 2]):
+                attr = curses.A_BOLD if row == 0 else 0
+                try:
+                    win.addnstr(row + 1, 2, line, box_w - 4, attr)
+                except curses.error:
+                    pass
+            win.noutrefresh()
+        except curses.error:
+            pass
+
+
+# ------------------------------------------------------------- plain modes
+
+def print_list(jobs):
+    now = time.time()
+    if not jobs:
+        print("(no jobs)")
+        return
+    print("%-19s  %-8s  %-7s  %s" % ("MODIFIED", "AGE", "FILES", "JOB"))
+    for job in jobs:
+        kinds = "+".join(k for k, f in (("out", job.out), ("err", job.err)) if f)
+        print("%-19s  %-8s  %-7s  %s" % (
+            fmt_time(job.mtime), fmt_ago(now - job.mtime, short=True), kinds, job.name))
+
+
+def print_plain(job):
+    """Print both files of a job, the way the original script did."""
+    out = sys.stdout
+    for kind, logfile in (("stdout", job.out), ("stderr", job.err)):
+        if logfile is None:
+            out.write("==> %s: (no file)\n" % kind)
+            continue
+        out.write("==> %s: %s  (%s, modified %s)\n" % (
+            kind, logfile.path, fmt_size(logfile.size), fmt_time(logfile.mtime)))
+        out.flush()
+        try:
+            with open(logfile.path, "rb") as fh:
+                data = fh.read()
+            out.buffer.write(data)
+            if data and not data.endswith(b"\n"):
+                out.buffer.write(b"\n")
+            out.buffer.flush()
+        except OSError as exc:
+            out.write("(cannot read file: %s)\n" % exc)
+
+
+# --------------------------------------------------------------------- main
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="lastjob",
+        description="Browse SLURM job logs (*.out/*.log and *.err) in a terminal UI.",
+        epilog=("Environment variables: LASTJOB_LOG_DIR, LASTJOB_REFRESH, "
+                "LASTJOB_MAX_BYTES (see the top of the script)."))
+    parser.add_argument("job", nargs="?",
+                        help="start on the newest job whose name contains this text")
+    parser.add_argument("-d", "--log-dir", metavar="DIR",
+                        default=os.environ.get("LASTJOB_LOG_DIR") or default_log_dir(),
+                        help="directory holding the log files (default: %(default)s)")
+    parser.add_argument("-p", "--plain", action="store_true",
+                        help="print the job's files and exit; automatic when "
+                             "stdout is not a terminal")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="list the jobs, newest first, and exit")
+    parser.add_argument("--refresh", type=float, metavar="SEC",
+                        default=env_number("LASTJOB_REFRESH", DEFAULT_REFRESH, float),
+                        help="seconds between rescans (default: %(default)s)")
+    parser.add_argument("--max-bytes", type=int, metavar="N",
+                        default=env_number("LASTJOB_MAX_BYTES", DEFAULT_MAX_BYTES, int),
+                        help="show only the last N bytes of each file (default: %(default)s)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    log_dir = os.path.abspath(os.path.expanduser(args.log_dir))
+    try:
+        jobs = scan_jobs(log_dir)
+    except OSError as exc:
+        sys.stderr.write("lastjob: cannot read log directory %s: %s\n"
+                         "lastjob: set LASTJOB_LOG_DIR or pass --log-dir\n"
+                         % (log_dir, exc.strerror or exc))
+        return 1
+    if args.list:
+        print_list(jobs)
+        return 0
+    selected = 0
+    if args.job:
+        matches = [i for i, job in enumerate(jobs) if args.job.lower() in job.name.lower()]
+        if not matches:
+            sys.stderr.write("lastjob: no job in %s matches %r\n" % (log_dir, args.job))
+            return 1
+        selected = matches[0]
+    if args.plain or not sys.stdout.isatty():
+        if not jobs:
+            sys.stderr.write("lastjob: no log files in %s\n" % log_dir)
+            return 1
+        print_plain(jobs[selected])
+        return 0
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    os.environ.setdefault("ESCDELAY", "25")
+    ui = [None]
+
+    def start(scr):
+        ui[0] = UI(scr, log_dir, args.refresh, max(1024, args.max_bytes), jobs, selected)
+        ui[0].run()
+
+    try:
+        curses.wrapper(start)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # e.g. `lastjob | head`: leave quietly like cat does
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)
